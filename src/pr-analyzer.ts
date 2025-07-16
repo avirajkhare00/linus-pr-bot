@@ -62,7 +62,7 @@ export class PRAnalyzer {
       isMergeable: prData.mergeable,
     };
 
-    const issues = this.analyzeIssues(prData, files, commits);
+    const issues = await this.analyzeIssues(prData, files, commits);
     const positives = this.analyzePositives(prData, files, commits);
     const concerns = this.analyzeConcerns(prData, files, commits);
 
@@ -80,7 +80,7 @@ export class PRAnalyzer {
   /**
    * Analyze potential issues in the PR
    */
-  private analyzeIssues(prData: PullRequestData, files: FileChange[], commits: Array<{ message: string; sha: string }>): Issue[] {
+  private async analyzeIssues(prData: PullRequestData, files: FileChange[], commits: Array<{ message: string; sha: string }>): Promise<Issue[]> {
     const issues: Issue[] = [];
 
     // Check for large PRs
@@ -136,41 +136,13 @@ export class PRAnalyzer {
       });
     }
 
-    // Check for potential code smells
-    files.forEach(file => {
+    // Check for potential code smells and analyze actual code changes
+    for (const file of files) {
       if (file.patch) {
-        // Check for console.log
-        if (file.patch.includes('console.log')) {
-          issues.push({
-            type: 'minor',
-            file: file.filename,
-            message: 'console.log statements found. Clean up your debugging mess.',
-          });
-        }
-
-        // Check for TODO comments
-        if (file.patch.includes('TODO') || file.patch.includes('FIXME')) {
-          issues.push({
-            type: 'minor',
-            file: file.filename,
-            message: 'TODO/FIXME comments. Either fix it now or create an issue.',
-          });
-        }
-
-        // Check for very long lines (basic check)
-        const lines = file.patch.split('\n');
-        lines.forEach((line, index) => {
-          if (line.length > 120 && line.startsWith('+')) {
-            issues.push({
-              type: 'style',
-              file: file.filename,
-              line: index + 1,
-              message: 'Line too long. Break it up.',
-            });
-          }
-        });
+        const codeIssues = await this.analyzeCodeChanges(file);
+        issues.push(...codeIssues);
       }
-    });
+    }
 
     // Check title and description
     if (!prData.title || prData.title.length < 10) {
@@ -281,5 +253,124 @@ export class PRAnalyzer {
     }
 
     return concerns;
+  }
+
+  /**
+ * Analyze actual code changes using AI or fallback to basic rules
+ */
+  private async analyzeCodeChanges(file: FileChange): Promise<Issue[]> {
+    // Try AI analysis first if OpenAI is available
+    const aiIssues = await this.analyzeCodeWithAI(file);
+    if (aiIssues.length > 0) {
+      return aiIssues;
+    }
+
+    // Fallback to basic rule-based analysis
+    return this.analyzeCodeWithRules(file);
+  }
+
+  /**
+   * Use AI to analyze code changes intelligently
+   */
+  private async analyzeCodeWithAI(file: FileChange): Promise<Issue[]> {
+    try {
+      const { config } = await import('./config');
+
+      // Skip if no OpenAI key or no patch
+      if (!config.openai.apiKey || !file.patch) {
+        return [];
+      }
+
+      const OpenAI = (await import('openai')).default;
+      const openai = new OpenAI({ apiKey: config.openai.apiKey });
+
+      const prompt = `Analyze this code diff for a file "${file.filename}" and identify issues:
+
+\`\`\`diff
+${file.patch}
+\`\`\`
+
+Return a JSON array of issues found in the NEW CODE (lines starting with +). Each issue should have:
+- type: "critical" | "major" | "minor" | "style"
+- message: A brief, direct critique (like Linus Torvalds would write)
+- line: Line number in the diff (optional)
+
+Focus on:
+- Security vulnerabilities
+- Error handling problems
+- Poor code quality
+- Performance issues
+- Bad practices
+- TypeScript/JavaScript specific issues
+- Logic errors
+
+Example response:
+[
+  {"type": "major", "message": "Missing error handling on async operation", "line": 15},
+  {"type": "minor", "message": "Variable name 'data' is not descriptive", "line": 23}
+]
+
+Return empty array [] if no significant issues found.`;
+
+      const response = await openai.chat.completions.create({
+        model: 'gpt-4',
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 1000,
+        temperature: 0.3, // Lower temperature for more consistent analysis
+      });
+
+      const content = response.choices[0]?.message?.content?.trim();
+      if (!content) return [];
+
+      // Parse AI response
+      const aiIssues = JSON.parse(content);
+
+      // Convert to our Issue format
+      return aiIssues.map((issue: any) => ({
+        type: issue.type || 'minor',
+        file: file.filename,
+        line: issue.line,
+        message: issue.message || 'Code issue detected',
+      }));
+
+    } catch (error) {
+      console.error('AI code analysis failed:', error);
+      return []; // Fallback to rule-based analysis
+    }
+  }
+
+  /**
+   * Basic rule-based code analysis (fallback)
+   */
+  private analyzeCodeWithRules(file: FileChange): Issue[] {
+    const issues: Issue[] = [];
+    const patch = file.patch || '';
+
+    // Basic checks only
+    if (patch.includes('console.log')) {
+      issues.push({
+        type: 'minor',
+        file: file.filename,
+        message: 'Console statements found. Clean up your debugging mess.',
+      });
+    }
+
+    if (patch.includes('TODO') || patch.includes('FIXME')) {
+      issues.push({
+        type: 'minor',
+        file: file.filename,
+        message: 'TODO/FIXME comments. Either fix it now or create an issue.',
+      });
+    }
+
+    if (patch.includes('eval(') || patch.includes('innerHTML')) {
+      issues.push({
+        type: 'critical',
+        file: file.filename,
+        message: 'Potential security vulnerability detected.',
+      });
+    }
+
+    return issues;
   }
 }
