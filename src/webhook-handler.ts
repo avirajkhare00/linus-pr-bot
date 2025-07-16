@@ -59,15 +59,22 @@ export class WebhookHandler {
 
       console.log(`Received webhook: ${event} - ${payload.action}`);
 
-      // Handle pull request events
+      // ✅ RESPOND TO GITHUB IMMEDIATELY (prevents timeout)
+      res.status(200).json({ message: 'Webhook received', event, action: payload.action });
+
+      // ✅ PROCESS ASYNCHRONOUSLY (don't await - let it run in background)
       if (event === 'pull_request') {
-        await this.handlePullRequestEvent(payload);
+        this.handlePullRequestEvent(payload).catch(error => {
+          console.error('Background PR processing failed:', error);
+        });
       }
 
-      res.status(200).json({ message: 'Webhook processed' });
     } catch (error) {
       console.error('Error handling webhook:', error);
-      res.status(500).json({ error: 'Internal server error' });
+      // Only send error response if we haven't responded yet
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Internal server error' });
+      }
     }
   }
 
@@ -131,26 +138,44 @@ export class WebhookHandler {
    * Review a pull request and post comment
    */
   private async reviewPullRequest(owner: string, repo: string, pullNumber: number): Promise<void> {
+    const startTime = Date.now();
     try {
       console.log(`🔍 Reviewing PR #${pullNumber} in ${owner}/${repo}`);
 
-      // Get PR data
-      const prData = await this.githubClient.getPullRequest(owner, repo, pullNumber);
+      // Add timeout wrapper to prevent hanging
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('Review timeout after 45 seconds')), 45000);
+      });
 
-      // Analyze the PR
-      const analysis = await this.prAnalyzer.analyzePR(prData, owner, repo);
+      const reviewPromise = this.performReview(owner, repo, pullNumber);
 
-      // Generate Linus-style comment
-      const comment = await this.linusGenerator.generateComment(analysis);
+      // Race between review completion and timeout
+      await Promise.race([reviewPromise, timeoutPromise]);
 
-      // Post comment
-      await this.githubClient.postComment(owner, repo, pullNumber, comment);
-
-      console.log(`✅ Successfully reviewed and commented on PR #${pullNumber}`);
+      const duration = Date.now() - startTime;
+      console.log(`✅ Successfully reviewed PR #${pullNumber} in ${duration}ms`);
     } catch (error) {
-      console.error(`❌ Error reviewing PR #${pullNumber}:`, error);
-      throw error;
+      const duration = Date.now() - startTime;
+      console.error(`❌ Error reviewing PR #${pullNumber} after ${duration}ms:`, error);
+      // Don't re-throw - let it fail silently to avoid webhook issues
     }
+  }
+
+  /**
+   * Perform the actual PR review (separated for timeout handling)
+   */
+  private async performReview(owner: string, repo: string, pullNumber: number): Promise<void> {
+    // Get PR data
+    const prData = await this.githubClient.getPullRequest(owner, repo, pullNumber);
+
+    // Analyze the PR
+    const analysis = await this.prAnalyzer.analyzePR(prData, owner, repo);
+
+    // Generate Linus-style comment
+    const comment = await this.linusGenerator.generateComment(analysis);
+
+    // Post comment
+    await this.githubClient.postComment(owner, repo, pullNumber, comment);
   }
 
   /**
